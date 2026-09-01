@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\CoupleController;
+use App\Http\Controllers\QuestionnaireController;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('auth')->group(function () {
@@ -17,4 +18,9 @@ Route::prefix('auth')->group(function () {
 Route::middleware('auth:sanctum')->prefix('couples')->group(function () {
     Route::post('/invitations', [CoupleController::class, 'createInvitation']);
     Route::post('/invitations/{code}/accept', [CoupleController::class, 'acceptInvitation']);
+});
+
+Route::middleware('auth:sanctum')->prefix('questionnaire')->group(function () {
+    Route::get('/', [QuestionnaireController::class, 'index']);
+    Route::post('/answers', [QuestionnaireController::class, 'answer']);
 });
