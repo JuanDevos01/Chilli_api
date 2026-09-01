@@ -3,15 +3,14 @@
 namespace App\Domain\Shared\Reactors;
 
 use Illuminate\Support\Facades\DB;
-use Spatie\EventSourcing\StoredEvents\Models\EloquentStoredEvent;
 
 trait IdempotentReactor
 {
-    protected function once(EloquentStoredEvent $storedEvent, callable $handler): void
+    protected function once(string $dedupKey, callable $handler): void
     {
         $inserted = DB::table('reactor_processed_events')->insertOrIgnore([
             'reactor' => static::class,
-            'stored_event_id' => $storedEvent->id,
+            'dedup_key' => $dedupKey,
             'created_at' => now(),
             'updated_at' => now(),
         ]);

@@ -11,10 +11,10 @@ return new class extends Migration
         Schema::create('reactor_processed_events', function (Blueprint $table) {
             $table->id();
             $table->string('reactor');
-            $table->unsignedBigInteger('stored_event_id');
+            $table->string('dedup_key');
             $table->timestamps();
 
-            $table->unique(['reactor', 'stored_event_id']);
+            $table->unique(['reactor', 'dedup_key']);
         });
     }
 

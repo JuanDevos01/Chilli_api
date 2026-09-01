@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Auth\AuthController;
 use App\Http\Controllers\CoupleController;
+use App\Http\Controllers\MatchController;
 use App\Http\Controllers\QuestionnaireController;
 use Illuminate\Support\Facades\Route;
 
@@ -24,3 +25,5 @@ Route::middleware('auth:sanctum')->prefix('questionnaire')->group(function () {
     Route::get('/', [QuestionnaireController::class, 'index']);
     Route::post('/answers', [QuestionnaireController::class, 'answer']);
 });
+
+Route::middleware('auth:sanctum')->get('/matches', [MatchController::class, 'index']);
