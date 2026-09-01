@@ -101,7 +101,7 @@ return [
      * and stored as json. You can customize the class name. A valid serializer
      * should implement Spatie\EventSourcing\EventSerializers\EventSerializer.
      */
-    'event_serializer' => Spatie\EventSourcing\EventSerializers\JsonEventSerializer::class,
+    'event_serializer' => App\Domain\Shared\EventSerializers\EncryptedEventSerializer::class,
 
     /*
      * These classes normalize and restore your events when they're serialized. They allow
@@ -150,5 +150,5 @@ return [
      * Note: This only affects queries filtered by aggregate_uuid. Global event queries
      * (without uuid filter) always use 'id' for proper cross-aggregate ordering.
      */
-    'aggregate_event_order_column' => 'id',
+    'aggregate_event_order_column' => 'aggregate_version',
 ];
