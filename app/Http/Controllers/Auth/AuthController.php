@@ -25,7 +25,7 @@ class AuthController extends Controller
             'password' => Hash::make($request->password),
         ]);
 
-        $token = $user->createToken('pepper-app')->plainTextToken;
+        $token = $user->createToken('chilli-app')->plainTextToken;
 
         return response()->json(['token' => $token, 'user' => $user], 201);
     }
@@ -45,7 +45,7 @@ class AuthController extends Controller
             ]);
         }
 
-        $token = $user->createToken('pepper-app')->plainTextToken;
+        $token = $user->createToken('chilli-app')->plainTextToken;
 
         return response()->json(['token' => $token, 'user' => $user]);
     }
