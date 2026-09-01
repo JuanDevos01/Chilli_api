@@ -101,7 +101,318 @@ Response HTTP (leyendo desde tablas de projection)
 
 ---
 
-## 5. Privacidad y cifrado
+## 5. El momento del match — paso a paso
+
+Esta sección narra el instante exacto en que el sistema detecta un match mutuo. Es el ejemplo que mejor muestra por qué usamos Event Sourcing en vez de "controllers que escriben en tablas". Se introducen los conceptos clave conforme aparecen.
+
+### Preludio — estado del sistema justo antes del match
+
+Digamos que Alice y Bob ya se registraron, ya son pareja, y Alice ha respondido `"yes"` a la pregunta Q1 hace 10 minutos. En este momento:
+
+**Tabla `stored_events`** (la **fuente de verdad** del sistema — cada fila es un hecho inmutable que ocurrió):
+
+| id | aggregate_uuid | event_class | event_properties |
+|---|---|---|---|
+| 1 | alice-uuid | `UserRegistered` | `{"uuid":"alice","name":"Alice",...}` |
+| 2 | bob-uuid | `UserRegistered` | `{"uuid":"bob","name":"Bob",...}` |
+| 3 | couple-uuid | `CoupleInvitationSent` | `{"coupleUuid":"c1","inviterUuid":"alice","code":"ABC123"}` |
+| 4 | couple-uuid | `CoupleInvitationAccepted` | `{"coupleUuid":"c1","accepterUuid":"bob"}` |
+| 5 | couple-uuid | `CoupleLinked` | `{"coupleUuid":"c1","userAUuid":"alice","userBUuid":"bob"}` |
+| 6 | alice-uuid | `QuestionAnswered` | `{"userUuid":"alice","questionUuid":"Q1","answer":"eyJpdi..."}` ← cifrado |
+
+**Tablas de lectura** (llamadas *projections* — son caché derivada, reconstruibles):
+
+`user_answers`:
+| user_uuid | question_uuid | answer |
+|---|---|---|
+| alice | Q1 | yes |
+
+`matches`: vacía
+
+---
+
+### T0 — Bob envía su respuesta
+
+```http
+POST /api/questionnaire/answers
+Authorization: Bearer <bob_token>
+
+{ "question_uuid": "Q1", "answer": "yes" }
+```
+
+### T1 — El controller delega en un *aggregate*, no escribe en la BD
+
+> **¿Qué es un aggregate?** Es una clase PHP que representa una entidad del dominio (aquí, "las respuestas de un usuario"). **Su trabajo es proteger las reglas de negocio.** El controller no decide nada — solo pide al aggregate que haga algo.
+
+El controller solo tiene tres líneas de lógica:
+
+```php
+QuestionnaireResponseAggregate::retrieve($bobUuid)   // reconstruye el aggregate desde su historia
+    ->answer($Q1, 'yes')                             // pide una acción
+    ->persist();                                      // graba los nuevos eventos
+```
+
+### T2 — El aggregate se reconstruye desde su historia
+
+`retrieve($bobUuid)` no lee ninguna tabla de "estado actual". Va a `stored_events`, filtra los eventos con `aggregate_uuid = bob-uuid`, y los aplica en orden para reconstruir el estado en memoria. Para Bob, aún no hay eventos suyos en questionnaires → estado vacío.
+
+> **Idea clave:** el estado del aggregate **no se guarda**. Se **recalcula** desde los eventos cada vez. Los eventos son lo único que persiste.
+
+### T3 — El aggregate valida y graba en su "memoria interna"
+
+```php
+public function answer(string $questionUuid, string $answer): self
+{
+    if (! in_array($answer, ['yes', 'no'], true)) {
+        throw new DomainException('Answer must be "yes" or "no".');
+    }
+
+    if (isset($this->answered[$questionUuid])) {
+        throw new DomainException('This question has already been answered.');
+    }
+
+    $this->recordThat(new QuestionAnswered($this->uuid(), $questionUuid, $answer));
+    return $this;
+}
+```
+
+`recordThat(...)` **no** escribe en la BD todavía — solo apunta "voy a grabar este evento cuando alguien llame `persist()`". Es la forma que tiene el aggregate de decir *"esto es lo que ha ocurrido"*.
+
+### T4 — `persist()` escribe el evento al store
+
+Ahora sí, el evento se guarda en `stored_events`. El campo `answer` **se cifra en este momento** por el `EncryptedEventSerializer` (ver sección 6):
+
+**Tabla `stored_events` — nueva fila:**
+
+| id | aggregate_uuid | event_class | event_properties |
+|---|---|---|---|
+| **7** | **bob-uuid** | **`QuestionAnswered`** | **`{"userUuid":"bob","questionUuid":"Q1","answer":"eyJpdi..."}`** ← cifrado |
+
+Este INSERT es lo único **imprescindible**. Todo lo que viene después son **reacciones** a este hecho.
+
+### T5 — Se dispara el `AnswerProjector` (síncrono, mismo request)
+
+> **¿Qué es un projector?** Es una clase cuyo único trabajo es **mantener una tabla de lectura actualizada** en respuesta a eventos. Nunca cambia su lógica del pasado — puedes borrar la tabla y reconstruirla corriendo el projector sobre todos los eventos históricos.
+
+El `AnswerProjector` recibe el evento `QuestionAnswered` (ya desencriptado por Spatie) y hace un simple insert:
+
+```php
+public function onQuestionAnswered(QuestionAnswered $event): void
+{
+    DB::table('user_answers')->insert([
+        'user_uuid' => $event->userUuid,
+        'question_uuid' => $event->questionUuid,
+        'answer' => $event->answer,
+        'answered_at' => now(),
+        ...
+    ]);
+}
+```
+
+**Tabla `user_answers` — nueva fila:**
+
+| user_uuid | question_uuid | answer |
+|---|---|---|
+| alice | Q1 | yes |
+| **bob** | **Q1** | **yes** ← nueva |
+
+### T6 — Se dispara el `DetectMutualMatchReactor` (aquí ocurre la magia)
+
+> **¿Qué es un reactor?** Es como un projector, pero para **efectos secundarios**: enviar un push, llamar a un servicio externo, o — como aquí — **decidir que algo nuevo debe ocurrir en el dominio**. La diferencia clave: el projector solo actualiza tablas de lectura; el reactor **puede provocar nuevos eventos**.
+
+Este es el reactor completo, con comentarios narrando cada paso:
+
+```php
+public function onQuestionAnswered(QuestionAnswered $event): void
+{
+    // Idempotencia: si este mismo evento ya fue procesado por este reactor
+    // (por replay, retry, etc.), no volvemos a ejecutar.
+    $this->once("qa:{$event->userUuid}:{$event->questionUuid}", function () use ($event) {
+
+        // 1. Bob dijo "yes"? (los "no" no producen match en Chilli)
+        if ($event->answer !== 'yes') {
+            return;
+        }
+
+        // 2. ¿Bob tiene pareja registrada?
+        $couple = $this->coupleOf($event->userUuid);
+        if (! $couple) {
+            return;
+        }
+
+        // 3. ¿Quién es el partner? (aquí, Alice)
+        $partnerUuid = $couple->user_a_uuid === $event->userUuid
+            ? $couple->user_b_uuid
+            : $couple->user_a_uuid;
+
+        // 4. ¿Qué respondió Alice a esta misma pregunta?
+        //    Consultamos la projection `user_answers` (poblada por AnswerProjector).
+        $partnerAnswer = DB::table('user_answers')
+            ->where('user_uuid', $partnerUuid)
+            ->where('question_uuid', $event->questionUuid)
+            ->value('answer');
+
+        // 5. ¿Alice también dijo "yes"? Si no, no hay match.
+        if ($partnerAnswer !== 'yes') {
+            return;
+        }
+
+        // 6. ¿Ya existe un match para esta pareja + pregunta? (guardia contra duplicados)
+        if ($this->matchAlreadyExists($couple->uuid, $event->questionUuid)) {
+            return;
+        }
+
+        // 7. ¡MATCH! Instanciamos un aggregate nuevo y le pedimos que emita el evento.
+        MatchAggregate::retrieve((string) Str::uuid())
+            ->detect($couple->uuid, $event->questionUuid, $couple->user_a_uuid, $couple->user_b_uuid)
+            ->persist();
+    });
+}
+```
+
+En este momento, en tiempo real dentro del mismo request de Bob:
+- ✅ Bob dijo "yes"
+- ✅ Bob está en pareja con Alice
+- ✅ Alice ya había dicho "yes" a Q1
+- ✅ No hay match previo para esta pregunta
+
+→ El reactor invoca a `MatchAggregate::detect(...)`.
+
+### T7 — Un nuevo evento nace: `MutualPreferencesDetected`
+
+El `MatchAggregate` valida sus propias reglas (que no exista ya un match para el mismo aggregate) y graba el evento:
+
+**Tabla `stored_events` — nueva fila:**
+
+| id | aggregate_uuid | event_class | event_properties |
+|---|---|---|---|
+| **8** | **match-uuid** | **`MutualPreferencesDetected`** | **`{"matchUuid":"m1","coupleUuid":"c1","questionUuid":"Q1","userAUuid":"alice","userBUuid":"bob"}`** |
+
+> **Observa lo importante:** el "match" no es una fila en una tabla que alguien decidió insertar — es un **hecho registrado** en la historia del sistema. Si mañana quisieras saber "¿cuándo ocurrió el primer match de esta pareja?" o "¿cuántos matches ha tenido Chilli este mes?", la respuesta está en `stored_events`, no en una tabla mutable.
+
+### T8 — El `MatchProjector` insertar la fila para lectura rápida
+
+```php
+public function onMutualPreferencesDetected(MutualPreferencesDetected $event): void
+{
+    DB::table('matches')->insert([
+        'uuid' => $event->matchUuid,
+        'couple_uuid' => $event->coupleUuid,
+        'question_uuid' => $event->questionUuid,
+        'user_a_uuid' => $event->userAUuid,
+        'user_b_uuid' => $event->userBUuid,
+        'detected_at' => now(),
+        ...
+    ]);
+}
+```
+
+**Tabla `matches` — nueva fila:**
+
+| uuid | couple_uuid | question_uuid | detected_at |
+|---|---|---|---|
+| m1 | c1 | Q1 | 2026-09-01 20:35:12 |
+
+### T9 — Bob recibe su response HTTP 201
+
+Todo lo anterior — desde T0 hasta T8 — ocurrió en el **mismo request** de Bob, síncronamente, en menos de 30 ms. Bob solo ve:
+
+```json
+{ "status": "recorded" }
+```
+
+No sabe (ni tiene por qué saber) que su respuesta desencadenó un match. La app móvil se enterará cuando pregunte por matches.
+
+### T10 — Alice o Bob consultan `GET /api/matches`
+
+```json
+{
+  "matches": [
+    {
+      "uuid": "m1",
+      "question_uuid": "Q1",
+      "question_text": "¿Te gustaría cocinar juntos una nueva receta este fin de semana?",
+      "detected_at": "2026-09-01T20:35:12Z"
+    }
+  ]
+}
+```
+
+**Nunca aparece** `user_a_answer`, `user_b_answer`, o el string `"yes"` — solo la pregunta y el momento. La privacidad está garantizada por diseño: la projection `matches` no incluye respuestas, y el controller ni siquiera las consulta.
+
+---
+
+### Diagrama temporal completo
+
+```
+Tiempo →
+
+T0  Bob POST /answers ─┐
+                       │
+T1  Controller crea    │  (un solo request HTTP)
+     aggregate         │
+T2  Aggregate se       │
+     reconstruye       │
+T3  Aggregate valida   │
+     y recordThat(...) │
+T4  persist() ────────►│  stored_events INSERT (QuestionAnswered, cifrado)
+                       │
+T5  AnswerProjector ──►│  user_answers INSERT (bob, Q1, "yes")
+                       │
+T6  DetectMutualMatch  │  lee couples, lee user_answers de Alice
+     Reactor           │  Alice también dijo "yes" → decide crear match
+                       │
+T7  MatchAggregate ───►│  stored_events INSERT (MutualPreferencesDetected)
+     ::detect().persist│
+                       │
+T8  MatchProjector ───►│  matches INSERT (couple, Q1, timestamp)
+                       │
+T9  HTTP 201 ──────────┘  ~30 ms total
+
+...
+
+T10 Alice GET /matches ─►  ve el match (query a matches + questions)
+    Bob   GET /matches ─►  ve el match (misma projection)
+```
+
+---
+
+### ¿Por qué esto es Event Sourcing y no un CRUD normal?
+
+Un enfoque "tradicional" con Laravel resolvería el match así:
+
+```php
+// AnswerController tradicional
+public function answer(Request $request) {
+    $answer = Answer::create([...]);           // guarda respuesta
+
+    $partnerAnswer = Answer::where(...)->first();
+    if ($partnerAnswer?->value === 'yes' && $answer->value === 'yes') {
+        Match::create([...]);                   // crea match
+        NotificationService::push(...);         // notifica
+    }
+
+    return response()->json(...);
+}
+```
+
+Funciona, pero:
+
+| Necesidad futura | CRUD tradicional | Event Sourcing |
+|---|---|---|
+| "¿Cuándo detectamos el primer match de esta pareja?" | Necesitas haber añadido `created_at` a `matches` y esperar que nadie lo edite | Lees `stored_events`, respuesta exacta |
+| "Queremos añadir estadísticas de tiempo entre respuestas y match" | Migración + recopilar datos desde ahora | Ya están en `stored_events`, reprocesas |
+| "Cambió la lógica de match, ¿podemos reprocesar todo el histórico?" | Escribir un script one-off complicado | `php artisan event-sourcing:replay MatchProjector` |
+| "Un cliente pide GDPR-borrado de sus respuestas" | UPDATE/DELETE en la tabla → información perdida | Nuevo evento `UserRedacted`, historial preservado, projection reconstruida |
+| "El reactor de notificaciones falló, ¿podemos reintentar?" | Job perdido, notificación perdida | Cola de eventos, retry natural |
+| "Queremos un dashboard de auditoría de qué pasó con cada pareja" | Poner logs por todas partes | Query directa sobre `stored_events` |
+| "Cambia el requisito: match requiere confirmación de ambos" | Refactor invasivo del controller | Nuevo evento `MatchConfirmed`, nuevo endpoint, projection se enriquece — sin tocar la lógica de detección |
+
+**La idea central:** en el flujo tradicional, `Match::create(...)` es la acción final; nadie sabrá jamás **por qué** apareció ese match salvo mirando los logs. En Event Sourcing, `MutualPreferencesDetected` es la acción; **el porqué está en `QuestionAnswered` de Alice y `QuestionAnswered` de Bob**, todo en la misma fuente de verdad, para siempre.
+
+---
+
+## 6. Privacidad y cifrado
 
 Requisito: los datos íntimos (respuestas del cuestionario) nunca deben leerse en claro desde la base de datos.
 
@@ -122,7 +433,7 @@ Además, el endpoint `GET /api/matches` **jamás** expone respuestas individuale
 
 ---
 
-## 6. Cómo correr el PoC
+## 7. Cómo correr el PoC
 
 ```bash
 cd /Users/juandevos/chilli-api
@@ -172,7 +483,7 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 
 ---
 
-## 7. Tests que respaldan el PoC
+## 8. Tests que respaldan el PoC
 
 | Archivo | Tests | Qué verifica |
 |---|---|---|
@@ -185,7 +496,7 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 
 ---
 
-## 8. Decisiones tomadas en este PoC
+## 9. Decisiones tomadas en este PoC
 
 | Decisión | Elección | Razón |
 |---|---|---|
@@ -200,7 +511,7 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 
 ---
 
-## 9. Fuera de alcance (asumido; **no** son bugs)
+## 10. Fuera de alcance (asumido; **no** son bugs)
 
 - Notificaciones push reales (stub).
 - Cuestionario completo con categorías, dificultad, versionado.
@@ -216,7 +527,7 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 
 ---
 
-## 10. Recomendaciones para escalar a producto
+## 11. Recomendaciones para escalar a producto
 
 **Bloqueadores para producción (deben resolverse antes):**
 
@@ -236,7 +547,7 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 
 ---
 
-## 11. Gotcha importante aprendido
+## 12. Gotcha importante aprendido
 
 Los handlers de eventos en `spatie/laravel-event-sourcing` v7 (métodos `on<Event>` en projectors y reactors) **solo aceptan un argumento**: el evento. Un segundo parámetro requerido (ej. `EloquentStoredEvent $storedEvent`) hace que el método se excluya silenciosamente del dispatch — el handler queda registrado en `event-sourcing:list` pero nunca ejecuta.
 
@@ -244,7 +555,7 @@ Los handlers de eventos en `spatie/laravel-event-sourcing` v7 (métodos `on<Even
 
 ---
 
-## 12. Historial de commits
+## 13. Historial de commits
 
 ```
 576ba2b  Match: reactor detects yes/yes on QuestionAnswered + reveal via GET /matches
@@ -259,7 +570,7 @@ f12c629  Initial commit: Laravel 13 skeleton + Sanctum Auth
 
 ---
 
-## 13. Recursos
+## 14. Recursos
 
 - **Documentación Spatie v7:** https://spatie.be/docs/laravel-event-sourcing/v7/introduction
 - **Custom serializer (usado aquí):** https://spatie.be/docs/laravel-event-sourcing/v7/advanced-usage/using-your-own-event-serializer
