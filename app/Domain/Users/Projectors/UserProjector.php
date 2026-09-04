@@ -3,6 +3,7 @@
 namespace App\Domain\Users\Projectors;
 
 use App\Domain\Users\Events\UserRegistered;
+use App\Domain\Users\Events\UserRegisteredViaProvider;
 use App\Models\User;
 use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
 
@@ -15,6 +16,17 @@ class UserProjector extends Projector
             'name' => $event->name,
             'email' => $event->email,
             'password' => $event->hashedPassword,
+        ]);
+    }
+
+    public function onUserRegisteredViaProvider(UserRegisteredViaProvider $event): void
+    {
+        User::create([
+            'uuid'             => $event->uuid,
+            'name'             => $event->name,
+            'email'            => $event->email,
+            'provider'         => $event->provider,
+            'provider_user_id' => $event->providerUserId,
         ]);
     }
 }
