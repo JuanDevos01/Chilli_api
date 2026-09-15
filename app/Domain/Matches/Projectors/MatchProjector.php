@@ -9,6 +9,11 @@ use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
 
 class MatchProjector extends Projector
 {
+    public function resetState(?string $aggregateUuid = null): void
+    {
+        DB::table('matches')->delete();
+    }
+
     public function onMutualPreferencesDetected(MutualPreferencesDetected $event): void
     {
         DB::table('matches')->insert([

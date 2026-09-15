@@ -493,8 +493,9 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 | `Feature/Questionnaires/AnswerQuestionTest.php` | 3 | Catalog, at-rest encryption, no double answer |
 | `Feature/Questionnaires/RetractAnswerTest.php` | 4 | Retraction before/after match, invariants |
 | `Feature/MutualMatchGoldenPathTest.php` | 4 | Full golden path + negative variants + privacy |
+| `Feature/EventSourcing/ReplayProjectionsTest.php` | 3 | Projections are disposable — rebuilt identically from stored_events |
 
-**Total: 22 tests / 118 assertions / green in < 400 ms**
+**Total: 25 tests / 145 assertions / green in < 500 ms**
 
 ---
 
@@ -610,7 +611,69 @@ Full history preserved in `stored_events`; nothing was deleted nor overwritten.
 
 ---
 
-## 14. Commit history
+## 14. Extension — Projection replay (2026-09-15)
+
+Once retraction proved that history is never mutated, the next natural question was:
+**if projection tables are just derived cache, can we prove we can throw them away and rebuild them from `stored_events` alone?** The answer is yes — this section documents the demonstration.
+
+### Question this extension answers
+
+> Are the read tables (`users`, `couples`, `matches`, `user_answers`, `couple_invitations`) truly disposable? Can `php artisan event-sourcing:replay` reconstruct them byte-identically from the event store, and what changes in the projector code make that safe?
+
+### Pieces added
+
+| Piece | Role |
+|---|---|
+| `UserProjector::resetState()` | Truncates `users` before replay. |
+| `CoupleProjector::resetState()` | Truncates `couples` and `couple_invitations` before replay. |
+| `AnswerProjector::resetState()` | Truncates `user_answers` before replay. |
+| `MatchProjector::resetState()` | Truncates `matches` before replay. |
+| `Feature/EventSourcing/ReplayProjectionsTest.php` | 3 tests: identical rebuild, recovery from dropped tables, endpoint parity. |
+
+Spatie's `Projectionist::replay()` looks for `resetState()` on each projector and calls it before dispatching stored events. Without it, replay would re-insert duplicate rows on top of existing ones. With it, replay is a safe, idempotent operation.
+
+### Validated flow
+
+```
+1. Alice + Bob register, pair up, both answer Q1: "yes", Alice answers Q2: "yes", Bob: "no"
+   → stored_events grows by 8 events
+   → projections filled: 2 users, 1 couple, 4 answers, 1 match
+
+2. Snapshot every projection table's rows (business fields only, ignoring auto-increment id)
+
+3. Run `php artisan event-sourcing:replay`
+   → each projector's resetState() truncates its tables
+   → all 8 events are re-dispatched in order to the projectors
+   → reactors are NOT re-invoked (Spatie only replays projectors)
+
+4. Assert:
+   - stored_events row count is unchanged
+   - every projection table is byte-identical (except row ids, which are storage artifacts)
+   - GET /api/matches returns the same JSON as before
+```
+
+### Business rules decided
+
+- **Row IDs are not part of the projection contract.** They are a SQLite/MySQL storage detail. The stable identity in the read model comes from UUIDs (`users.uuid`, `couples.uuid`, `matches.uuid`).
+- **`resetState()` lives on each projector, not in a global CLI hook.** This keeps each bounded context responsible for its own read tables and lets `event-sourcing:replay ProjectorName` reset only what that projector owns.
+- **Reactors are never replayed.** This is Spatie's default and the correct semantics — replaying reactors would resend push notifications, re-charge payments, etc. All secondary events (like `MutualPreferencesDetected`) live in the event store from the original run and are re-projected as any other event.
+
+### Learnings
+
+1. **`event-sourcing:replay` is only safe if every projector implements `resetState()`.** Without it, the CLI command silently doubles rows. The PoC now makes replay a first-class, production-ready operation.
+2. **Timestamps written with `now()` inside projectors drift on replay.** The test uses `$this->travelTo()` to freeze time so both the original run and the replay produce identical timestamp columns. In production, the projector should ideally read the event's own `createdAt()` instead of calling `now()` — noted as a follow-up.
+3. **Row-level IDs are an escape hatch of ES purity.** Any code that stores the numeric `id` of a projection row externally (e.g. as a foreign key elsewhere) will break on replay. UUIDs sidestep this entirely — another argument for making UUID the primary identity in every bounded context.
+4. **This is the moment ES pays for its complexity.** The same event stream can be re-projected into a *different* schema without asking users anything or writing a data-migration script. That capability is impossible in a CRUD architecture and is the strongest argument for keeping ES for Chilli's core.
+
+### Three superpowers this unlocks
+
+- **Schema evolution without backfill SQL.** Change a projector, run replay, projections reflect the new shape all the way back to event #1.
+- **New analytics without data loss.** Add a `MatchStatsProjector` today, run replay, and get historical stats from the very first couple — no need to have foreseen the metric.
+- **Deterministic bug reproduction.** A user reports a mismatched match from three weeks ago? The events are still there; replay reproduces the exact same projector behavior.
+
+---
+
+## 15. Commit history
 
 ```
 576ba2b  Match: reactor detects yes/yes on QuestionAnswered + reveal via GET /matches
@@ -625,7 +688,7 @@ f12c629  Initial commit: Laravel 13 skeleton + Sanctum Auth
 
 ---
 
-## 15. Resources
+## 16. Resources
 
 - **Spatie v7 docs:** https://spatie.be/docs/laravel-event-sourcing/v7/introduction
 - **Custom serializer (used here):** https://spatie.be/docs/laravel-event-sourcing/v7/advanced-usage/using-your-own-event-serializer

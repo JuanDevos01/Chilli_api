@@ -9,6 +9,11 @@ use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
 
 class AnswerProjector extends Projector
 {
+    public function resetState(?string $aggregateUuid = null): void
+    {
+        DB::table('user_answers')->delete();
+    }
+
     public function onQuestionAnswered(QuestionAnswered $event): void
     {
         DB::table('user_answers')->insert([

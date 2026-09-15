@@ -10,6 +10,12 @@ use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
 
 class CoupleProjector extends Projector
 {
+    public function resetState(?string $aggregateUuid = null): void
+    {
+        DB::table('couples')->delete();
+        DB::table('couple_invitations')->delete();
+    }
+
     public function onCoupleInvitationSent(CoupleInvitationSent $event): void
     {
         DB::table('couple_invitations')->insert([
