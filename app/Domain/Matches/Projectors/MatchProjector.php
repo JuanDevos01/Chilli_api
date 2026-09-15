@@ -2,6 +2,7 @@
 
 namespace App\Domain\Matches\Projectors;
 
+use App\Domain\Matches\Events\MatchInvalidated;
 use App\Domain\Matches\Events\MutualPreferencesDetected;
 use Illuminate\Support\Facades\DB;
 use Spatie\EventSourcing\EventHandlers\Projectors\Projector;
@@ -20,5 +21,15 @@ class MatchProjector extends Projector
             'created_at' => now(),
             'updated_at' => now(),
         ]);
+    }
+
+    public function onMatchInvalidated(MatchInvalidated $event): void
+    {
+        DB::table('matches')
+            ->where('uuid', $event->matchUuid)
+            ->update([
+                'invalidated_at' => now(),
+                'updated_at' => now(),
+            ]);
     }
 }

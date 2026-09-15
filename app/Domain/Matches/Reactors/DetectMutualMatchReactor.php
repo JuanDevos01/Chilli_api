@@ -3,6 +3,7 @@
 namespace App\Domain\Matches\Reactors;
 
 use App\Domain\Matches\Aggregates\MatchAggregate;
+use App\Domain\Questionnaires\Events\AnswerRetracted;
 use App\Domain\Questionnaires\Events\QuestionAnswered;
 use App\Domain\Shared\Reactors\IdempotentReactor;
 use Illuminate\Support\Facades\DB;
@@ -34,18 +35,45 @@ class DetectMutualMatchReactor extends Reactor
             $partnerAnswer = DB::table('user_answers')
                 ->where('user_uuid', $partnerUuid)
                 ->where('question_uuid', $event->questionUuid)
+                ->whereNull('retracted_at')
                 ->value('answer');
 
             if ($partnerAnswer !== 'yes') {
                 return;
             }
 
-            if ($this->matchAlreadyExists($couple->uuid, $event->questionUuid)) {
+            if ($this->activeMatchExists($couple->uuid, $event->questionUuid)) {
                 return;
             }
 
             MatchAggregate::retrieve((string) Str::uuid())
                 ->detect($couple->uuid, $event->questionUuid, $couple->user_a_uuid, $couple->user_b_uuid)
+                ->persist();
+        });
+    }
+
+    public function onAnswerRetracted(AnswerRetracted $event): void
+    {
+        $dedupKey = "ar:{$event->userUuid}:{$event->questionUuid}";
+
+        $this->once($dedupKey, function () use ($event) {
+            $couple = $this->coupleOf($event->userUuid);
+            if (! $couple) {
+                return;
+            }
+
+            $matchUuid = DB::table('matches')
+                ->where('couple_uuid', $couple->uuid)
+                ->where('question_uuid', $event->questionUuid)
+                ->whereNull('invalidated_at')
+                ->value('uuid');
+
+            if (! $matchUuid) {
+                return;
+            }
+
+            MatchAggregate::retrieve($matchUuid)
+                ->invalidate('answer_retracted')
                 ->persist();
         });
     }
@@ -58,11 +86,12 @@ class DetectMutualMatchReactor extends Reactor
             ->first();
     }
 
-    private function matchAlreadyExists(string $coupleUuid, string $questionUuid): bool
+    private function activeMatchExists(string $coupleUuid, string $questionUuid): bool
     {
         return DB::table('matches')
             ->where('couple_uuid', $coupleUuid)
             ->where('question_uuid', $questionUuid)
+            ->whereNull('invalidated_at')
             ->exists();
     }
 }

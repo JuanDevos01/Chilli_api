@@ -35,4 +35,15 @@ class QuestionnaireController extends Controller
 
         return response()->json(['status' => 'recorded'], 201);
     }
+
+    public function retract(Request $request, string $questionUuid): JsonResponse
+    {
+        $userUuid = $request->user()->uuid;
+
+        QuestionnaireResponseAggregate::retrieve($userUuid)
+            ->retract($questionUuid)
+            ->persist();
+
+        return response()->json(['status' => 'retracted']);
+    }
 }

@@ -19,6 +19,7 @@ class MatchController extends Controller
                 $q->where('couples.user_a_uuid', $userUuid)
                     ->orWhere('couples.user_b_uuid', $userUuid);
             })
+            ->whereNull('matches.invalidated_at')
             ->orderBy('matches.detected_at', 'desc')
             ->get([
                 'matches.uuid',
