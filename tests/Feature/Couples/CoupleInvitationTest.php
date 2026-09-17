@@ -63,6 +63,40 @@ class CoupleInvitationTest extends TestCase
         $second->assertStatus(422);
     }
 
+    public function test_couples_me_returns_null_when_user_is_not_paired(): void
+    {
+        $alice = $this->createUser('alice@example.com');
+
+        $response = $this->actingAs($alice)->getJson('/api/couples/me');
+
+        $response->assertOk();
+        $response->assertExactJson(['couple' => null]);
+    }
+
+    public function test_couples_me_returns_partner_info_when_user_is_paired(): void
+    {
+        $alice = $this->createUser('alice@example.com');
+        $bob = $this->createUser('bob@example.com');
+
+        $create = $this->actingAs($alice)->postJson('/api/couples/invitations');
+        $this->actingAs($bob)->postJson("/api/couples/invitations/{$create->json('code')}/accept")->assertOk();
+
+        $aliceMe = $this->actingAs($alice)->getJson('/api/couples/me');
+        $aliceMe->assertOk();
+        $aliceMe->assertJsonPath('couple.partner.uuid', $bob->uuid);
+        $aliceMe->assertJsonPath('couple.partner.name', 'bob');
+        $aliceMe->assertJsonPath('couple.partner.email', 'bob@example.com');
+
+        $bobMe = $this->actingAs($bob)->getJson('/api/couples/me');
+        $bobMe->assertJsonPath('couple.partner.uuid', $alice->uuid);
+        $bobMe->assertJsonPath('couple.partner.name', 'alice');
+    }
+
+    public function test_couples_me_requires_authentication(): void
+    {
+        $this->getJson('/api/couples/me')->assertUnauthorized();
+    }
+
     private function createUser(string $email): User
     {
         return User::create([

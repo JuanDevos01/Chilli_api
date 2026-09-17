@@ -10,12 +10,28 @@ use Illuminate\Validation\Rule;
 
 class QuestionnaireController extends Controller
 {
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
+        $userUuid = $request->user()->uuid;
+
         $questions = DB::table('questions')
-            ->select(['uuid', 'text'])
-            ->orderBy('id')
-            ->get();
+            ->leftJoin('user_answers', function ($join) use ($userUuid) {
+                $join->on('user_answers.question_uuid', '=', 'questions.uuid')
+                    ->where('user_answers.user_uuid', '=', $userUuid)
+                    ->whereNull('user_answers.retracted_at');
+            })
+            ->select([
+                'questions.uuid',
+                'questions.text',
+                'user_answers.answer as my_answer',
+            ])
+            ->orderBy('questions.id')
+            ->get()
+            ->map(fn ($row) => [
+                'uuid' => $row->uuid,
+                'text' => $row->text,
+                'my_answer' => $row->my_answer,
+            ]);
 
         return response()->json(['questions' => $questions]);
     }

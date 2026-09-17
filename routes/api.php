@@ -20,6 +20,7 @@ Route::prefix('auth')->group(function () {
 });
 
 Route::middleware('auth:sanctum')->prefix('couples')->group(function () {
+    Route::get('/me', [CoupleController::class, 'me']);
     Route::post('/invitations', [CoupleController::class, 'createInvitation']);
     Route::post('/invitations/{code}/accept', [CoupleController::class, 'acceptInvitation']);
 });

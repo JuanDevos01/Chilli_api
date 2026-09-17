@@ -29,8 +29,78 @@ class AnswerQuestionTest extends TestCase
         $response = $this->actingAs($user)->getJson('/api/questionnaire');
 
         $response->assertOk();
-        $response->assertJsonStructure(['questions' => [['uuid', 'text']]]);
+        $response->assertJsonStructure(['questions' => [['uuid', 'text', 'my_answer']]]);
         $this->assertCount(3, $response->json('questions'));
+    }
+
+    public function test_index_returns_null_my_answer_when_user_has_not_answered(): void
+    {
+        $user = $this->createUser();
+
+        $response = $this->actingAs($user)->getJson('/api/questionnaire');
+
+        foreach ($response->json('questions') as $q) {
+            $this->assertNull($q['my_answer']);
+        }
+    }
+
+    public function test_index_returns_my_answer_when_user_has_answered(): void
+    {
+        $user = $this->createUser();
+        $q1 = '11111111-1111-1111-1111-111111111111';
+        $q2 = '22222222-2222-2222-2222-222222222222';
+
+        $this->actingAs($user)->postJson('/api/questionnaire/answers', [
+            'question_uuid' => $q1,
+            'answer' => 'yes',
+        ])->assertCreated();
+
+        $this->actingAs($user)->postJson('/api/questionnaire/answers', [
+            'question_uuid' => $q2,
+            'answer' => 'no',
+        ])->assertCreated();
+
+        $questions = $this->actingAs($user)->getJson('/api/questionnaire')->json('questions');
+
+        $byUuid = collect($questions)->keyBy('uuid');
+        $this->assertSame('yes', $byUuid[$q1]['my_answer']);
+        $this->assertSame('no', $byUuid[$q2]['my_answer']);
+        $this->assertNull($byUuid['33333333-3333-3333-3333-333333333333']['my_answer']);
+    }
+
+    public function test_index_treats_retracted_answers_as_null(): void
+    {
+        $user = $this->createUser();
+        $q1 = '11111111-1111-1111-1111-111111111111';
+
+        $this->actingAs($user)->postJson('/api/questionnaire/answers', [
+            'question_uuid' => $q1,
+            'answer' => 'yes',
+        ])->assertCreated();
+
+        $this->actingAs($user)->deleteJson("/api/questionnaire/answers/{$q1}")->assertOk();
+
+        $questions = $this->actingAs($user)->getJson('/api/questionnaire')->json('questions');
+
+        $q1Row = collect($questions)->firstWhere('uuid', $q1);
+        $this->assertNull($q1Row['my_answer']);
+    }
+
+    public function test_index_does_not_leak_partner_answers(): void
+    {
+        $alice = $this->createUser();
+        $bob = $this->createUser();
+        $q1 = '11111111-1111-1111-1111-111111111111';
+
+        $this->actingAs($bob)->postJson('/api/questionnaire/answers', [
+            'question_uuid' => $q1,
+            'answer' => 'yes',
+        ])->assertCreated();
+
+        $questions = $this->actingAs($alice)->getJson('/api/questionnaire')->json('questions');
+
+        $q1Row = collect($questions)->firstWhere('uuid', $q1);
+        $this->assertNull($q1Row['my_answer'], "Alice must not see Bob's answer");
     }
 
     public function test_answer_records_event_with_encrypted_payload(): void

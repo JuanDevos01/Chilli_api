@@ -64,6 +64,37 @@ class CoupleController extends Controller
         ]);
     }
 
+    public function me(Request $request): JsonResponse
+    {
+        $userUuid = $request->user()->uuid;
+
+        $couple = DB::table('couples')
+            ->where('user_a_uuid', $userUuid)
+            ->orWhere('user_b_uuid', $userUuid)
+            ->first();
+
+        if (! $couple) {
+            return response()->json(['couple' => null]);
+        }
+
+        $partnerUuid = $couple->user_a_uuid === $userUuid
+            ? $couple->user_b_uuid
+            : $couple->user_a_uuid;
+
+        $partner = DB::table('users')
+            ->where('uuid', $partnerUuid)
+            ->select('uuid', 'name', 'email')
+            ->first();
+
+        return response()->json([
+            'couple' => [
+                'uuid' => $couple->uuid,
+                'linked_at' => $couple->linked_at,
+                'partner' => $partner,
+            ],
+        ]);
+    }
+
     private function userAlreadyInCouple(string $userUuid): bool
     {
         return DB::table('couples')
