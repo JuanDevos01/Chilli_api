@@ -35,4 +35,11 @@ return [
         ],
     ],
 
+    'minimax' => [
+        'key' => env('MINIMAX_API_KEY'),
+        'base_url' => env('MINIMAX_BASE_URL', 'https://api.minimax.io/v1/'),
+        'model' => env('MINIMAX_MODEL', 'MiniMax-M3'),
+        'timeout_seconds' => env('MINIMAX_TIMEOUT_SECONDS', 20),
+    ],
+
 ];

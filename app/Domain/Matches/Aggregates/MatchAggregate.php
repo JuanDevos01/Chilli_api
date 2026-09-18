@@ -12,10 +12,26 @@ class MatchAggregate extends AggregateRoot
     private bool $detected = false;
     private bool $invalidated = false;
 
-    public function detect(string $coupleUuid, string $questionUuid, string $userAUuid, string $userBUuid): self
-    {
+    /**
+     * @param string[] $matchedDimensions
+     * @param string[] $divergingDimensions
+     */
+    public function detect(
+        string $coupleUuid,
+        string $questionUuid,
+        string $userAUuid,
+        string $userBUuid,
+        ?string $narrative = null,
+        array $matchedDimensions = [],
+        array $divergingDimensions = [],
+        ?float $confidence = null,
+    ): self {
         if ($this->detected) {
             throw new DomainException('Match already detected.');
+        }
+
+        if ($confidence !== null && ($confidence < 0.0 || $confidence > 1.0)) {
+            throw new DomainException('Confidence must be between 0 and 1.');
         }
 
         $this->recordThat(new MutualPreferencesDetected(
@@ -24,6 +40,10 @@ class MatchAggregate extends AggregateRoot
             $questionUuid,
             $userAUuid,
             $userBUuid,
+            $narrative,
+            $matchedDimensions,
+            $divergingDimensions,
+            $confidence,
         ));
 
         return $this;

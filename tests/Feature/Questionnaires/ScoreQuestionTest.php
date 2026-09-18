@@ -3,6 +3,7 @@
 namespace Tests\Feature\Questionnaires;
 
 use App\Domain\Matches\Events\MutualPreferencesDetected;
+use App\Domain\Matches\Services\CompatibilityJudge;
 use App\Domain\Questionnaires\Events\QuestionScored;
 use App\Models\User;
 use Database\Seeders\QuestionSeeder;
@@ -11,6 +12,7 @@ use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Spatie\EventSourcing\StoredEvents\Models\EloquentStoredEvent;
+use Tests\Support\FakeCompatibilityJudge;
 use Tests\TestCase;
 
 class ScoreQuestionTest extends TestCase
@@ -19,10 +21,14 @@ class ScoreQuestionTest extends TestCase
 
     private const Q1 = '11111111-1111-1111-1111-111111111111';
 
+    private FakeCompatibilityJudge $judge;
+
     protected function setUp(): void
     {
         parent::setUp();
         $this->seed(QuestionSeeder::class);
+        $this->judge = new FakeCompatibilityJudge();
+        $this->app->instance(CompatibilityJudge::class, $this->judge);
     }
 
     public function test_index_exposes_dimensions_and_null_my_scores_by_default(): void
@@ -156,7 +162,7 @@ class ScoreQuestionTest extends TestCase
         $this->assertNull($q1['my_scores']);
     }
 
-    public function test_placeholder_match_fires_when_both_score_all_dimensions_above_threshold(): void
+    public function test_reactor_calls_judge_with_question_dimensions_and_both_partner_scores(): void
     {
         [$alice, $bob] = $this->registerCouple();
 
@@ -165,31 +171,97 @@ class ScoreQuestionTest extends TestCase
             'scores' => ['general' => 80, 'timing' => 90],
         ])->assertCreated();
 
-        $this->assertSame(0, EloquentStoredEvent::where('event_class', MutualPreferencesDetected::class)->count());
+        $this->assertCount(0, $this->judge->calls, 'judge should not be called until both partners scored');
 
         $this->actingAs($bob)->postJson('/api/questionnaire/scores', [
             'question_uuid' => self::Q1,
             'scores' => ['general' => 95, 'timing' => 75],
         ])->assertCreated();
 
-        $this->assertSame(1, EloquentStoredEvent::where('event_class', MutualPreferencesDetected::class)->count());
+        $this->assertCount(1, $this->judge->calls);
+        $call = $this->judge->calls[0];
+        $this->assertStringContainsString('cook a new recipe', $call['questionText']);
+        $this->assertCount(3, $call['dimensions']);
+        $this->assertSame(['general' => 80, 'timing' => 90], $call['userAScores']);
+        $this->assertSame(['general' => 95, 'timing' => 75], $call['userBScores']);
     }
 
-    public function test_placeholder_match_does_not_fire_when_one_dimension_is_below_threshold(): void
+    public function test_match_fires_when_judge_returns_match_true_and_persists_narrative(): void
     {
         [$alice, $bob] = $this->registerCouple();
 
+        $this->judge->push(new \App\Domain\Matches\Services\JudgmentResult(
+            match: true,
+            confidence: 0.87,
+            matchedDimensions: ['general', 'turn_on'],
+            divergingDimensions: ['timing'],
+            narrative: 'You both feel adventurous, but Alice wants it sooner than Bob.',
+        ));
+
         $this->actingAs($alice)->postJson('/api/questionnaire/scores', [
             'question_uuid' => self::Q1,
-            'scores' => ['general' => 85, 'timing' => 65],
+            'scores' => ['general' => 90, 'timing' => 95, 'turn_on' => 85],
         ])->assertCreated();
-
         $this->actingAs($bob)->postJson('/api/questionnaire/scores', [
             'question_uuid' => self::Q1,
-            'scores' => ['general' => 95, 'timing' => 90],
+            'scores' => ['general' => 85, 'timing' => 55, 'turn_on' => 80],
+        ])->assertCreated();
+
+        $this->assertSame(1, EloquentStoredEvent::where('event_class', MutualPreferencesDetected::class)->count());
+
+        $match = \DB::table('matches')->first();
+        $this->assertNotNull($match);
+        $this->assertSame('You both feel adventurous, but Alice wants it sooner than Bob.', $match->narrative);
+        $this->assertSame(['general', 'turn_on'], json_decode($match->matched_dimensions, true));
+        $this->assertSame(['timing'], json_decode($match->diverging_dimensions, true));
+        $this->assertEquals(0.87, (float) $match->confidence);
+    }
+
+    public function test_match_does_not_fire_when_judge_returns_match_false(): void
+    {
+        [$alice, $bob] = $this->registerCouple();
+
+        $this->judge->push(\App\Domain\Matches\Services\JudgmentResult::noMatch('too divergent'));
+
+        $this->actingAs($alice)->postJson('/api/questionnaire/scores', [
+            'question_uuid' => self::Q1,
+            'scores' => ['general' => 90, 'timing' => 90, 'turn_on' => 90],
+        ])->assertCreated();
+        $this->actingAs($bob)->postJson('/api/questionnaire/scores', [
+            'question_uuid' => self::Q1,
+            'scores' => ['general' => 20, 'timing' => 30, 'turn_on' => 15],
         ])->assertCreated();
 
         $this->assertSame(0, EloquentStoredEvent::where('event_class', MutualPreferencesDetected::class)->count());
+    }
+
+    public function test_matches_endpoint_exposes_narrative_and_dimensions(): void
+    {
+        [$alice, $bob] = $this->registerCouple();
+
+        $this->judge->push(new \App\Domain\Matches\Services\JudgmentResult(
+            match: true,
+            confidence: 0.9,
+            matchedDimensions: ['general'],
+            divergingDimensions: [],
+            narrative: 'A test narrative for the reveal card.',
+        ));
+
+        $this->actingAs($alice)->postJson('/api/questionnaire/scores', [
+            'question_uuid' => self::Q1,
+            'scores' => ['general' => 80, 'timing' => 80, 'turn_on' => 80],
+        ])->assertCreated();
+        $this->actingAs($bob)->postJson('/api/questionnaire/scores', [
+            'question_uuid' => self::Q1,
+            'scores' => ['general' => 90, 'timing' => 90, 'turn_on' => 90],
+        ])->assertCreated();
+
+        $response = $this->actingAs($alice)->getJson('/api/matches');
+        $response->assertOk();
+        $response->assertJsonPath('matches.0.narrative', 'A test narrative for the reveal card.');
+        $response->assertJsonPath('matches.0.matched_dimensions', ['general']);
+        $response->assertJsonPath('matches.0.diverging_dimensions', []);
+        $response->assertJsonPath('matches.0.confidence', 0.9);
     }
 
     /** @return array{0: User, 1: User} */

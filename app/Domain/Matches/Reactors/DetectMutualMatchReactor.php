@@ -3,6 +3,7 @@
 namespace App\Domain\Matches\Reactors;
 
 use App\Domain\Matches\Aggregates\MatchAggregate;
+use App\Domain\Matches\Services\CompatibilityJudge;
 use App\Domain\Questionnaires\Events\AnswerRetracted;
 use App\Domain\Questionnaires\Events\QuestionAnswered;
 use App\Domain\Questionnaires\Events\QuestionScored;
@@ -14,12 +15,6 @@ use Spatie\EventSourcing\EventHandlers\Reactors\Reactor;
 class DetectMutualMatchReactor extends Reactor
 {
     use IdempotentReactor;
-
-    /**
-     * Placeholder threshold used by the scalar match detector until we replace
-     * the logic with the LLM-based compatibility judge (per Thomas 2026-09-17).
-     */
-    private const SCALAR_MATCH_THRESHOLD = 70;
 
     public function onQuestionAnswered(QuestionAnswered $event): void
     {
@@ -64,10 +59,6 @@ class DetectMutualMatchReactor extends Reactor
         $dedupKey = "qs:{$event->userUuid}:{$event->questionUuid}";
 
         $this->once($dedupKey, function () use ($event) {
-            if (! $this->allDimensionsAtOrAbove($event->scores, self::SCALAR_MATCH_THRESHOLD)) {
-                return;
-            }
-
             $couple = $this->coupleOf($event->userUuid);
             if (! $couple) {
                 return;
@@ -88,16 +79,44 @@ class DetectMutualMatchReactor extends Reactor
             }
 
             $partnerScores = json_decode($partnerRow, true) ?: [];
-            if (! $this->allDimensionsAtOrAbove($partnerScores, self::SCALAR_MATCH_THRESHOLD)) {
-                return;
-            }
 
             if ($this->activeMatchExists($couple->uuid, $event->questionUuid)) {
                 return;
             }
 
+            $question = DB::table('questions')
+                ->where('uuid', $event->questionUuid)
+                ->select('text', 'dimensions')
+                ->first();
+
+            if (! $question) {
+                return;
+            }
+
+            $dimensions = $question->dimensions ? (json_decode($question->dimensions, true) ?: []) : [];
+
+            [$userAScores, $userBScores] = $couple->user_a_uuid === $event->userUuid
+                ? [$event->scores, $partnerScores]
+                : [$partnerScores, $event->scores];
+
+            $judge = app(CompatibilityJudge::class);
+            $verdict = $judge->judge($question->text, $dimensions, $userAScores, $userBScores);
+
+            if (! $verdict->match) {
+                return;
+            }
+
             MatchAggregate::retrieve((string) Str::uuid())
-                ->detect($couple->uuid, $event->questionUuid, $couple->user_a_uuid, $couple->user_b_uuid)
+                ->detect(
+                    $couple->uuid,
+                    $event->questionUuid,
+                    $couple->user_a_uuid,
+                    $couple->user_b_uuid,
+                    $verdict->narrative,
+                    $verdict->matchedDimensions,
+                    $verdict->divergingDimensions,
+                    $verdict->confidence,
+                )
                 ->persist();
         });
     }
@@ -126,24 +145,6 @@ class DetectMutualMatchReactor extends Reactor
                 ->invalidate('answer_retracted')
                 ->persist();
         });
-    }
-
-    /**
-     * @param array<string, int|numeric-string> $scores
-     */
-    private function allDimensionsAtOrAbove(array $scores, int $threshold): bool
-    {
-        if ($scores === []) {
-            return false;
-        }
-
-        foreach ($scores as $value) {
-            if ((int) $value < $threshold) {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     private function coupleOf(string $userUuid): ?object
