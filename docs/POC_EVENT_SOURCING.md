@@ -44,7 +44,7 @@ At no point is any individual partner answer accessible to the other — only ye
 |---|---|---|---|---|
 | **Users** | `UserAggregate` | `UserRegistered` | `UserProjector` | — |
 | **Couples** | `CoupleAggregate` | `CoupleInvitationSent`, `CoupleInvitationAccepted`, `CoupleLinked` | `CoupleProjector` | — |
-| **Questionnaires** | `QuestionnaireResponseAggregate` | `QuestionAnswered` *(the `answer` field is marked `#[Encrypted]`)*, `AnswerRetracted` | `AnswerProjector` | — |
+| **Questionnaires** | `QuestionnaireResponseAggregate` | `QuestionAnswered` *(binary, `answer` `#[Encrypted]`)*, `QuestionScored` *(scalar, `scores` map `#[Encrypted]`)*, `AnswerRetracted` | `AnswerProjector` | — |
 | **Matches** | `MatchAggregate` | `MutualPreferencesDetected`, `MatchInvalidated` | `MatchProjector` | `DetectMutualMatchReactor` |
 
 ### Exposed endpoints
@@ -58,8 +58,9 @@ At no point is any individual partner answer accessible to the other — only ye
 | POST | `/api/couples/invitations` | Creates invitation; returns shareable `code`. |
 | POST | `/api/couples/invitations/{code}/accept` | Accepts invitation and links couple. |
 | GET | `/api/questionnaire` | Catalog of questions (seed). |
-| POST | `/api/questionnaire/answers` | Records answer (encrypted at-rest). |
-| DELETE | `/api/questionnaire/answers/{questionUuid}` | Retracts an answer. Emits `AnswerRetracted`; invalidates the match if one existed. |
+| POST | `/api/questionnaire/answers` | Records binary answer (encrypted at-rest). *Legacy — retained for tests.* |
+| POST | `/api/questionnaire/scores` | Records scalar multi-dimensional answer (scores map encrypted at-rest). |
+| DELETE | `/api/questionnaire/answers/{questionUuid}` | Retracts a response (binary or scalar). Emits `AnswerRetracted`; invalidates the match if one existed. |
 | GET | `/api/matches` | Revealed matches for the user's couple (excludes invalidated ones). |
 
 ---
@@ -494,8 +495,9 @@ curl -s http://localhost:8000/api/matches -H "Authorization: Bearer $BOB_TOKEN" 
 | `Feature/Questionnaires/RetractAnswerTest.php` | 4 | Retraction before/after match, invariants |
 | `Feature/MutualMatchGoldenPathTest.php` | 4 | Full golden path + negative variants + privacy |
 | `Feature/EventSourcing/ReplayProjectionsTest.php` | 3 | Projections are disposable — rebuilt identically from stored_events |
+| `Feature/Questionnaires/ScoreQuestionTest.php` | 10 | Scalar multi-dim answers: encryption, invariants, no leakage, placeholder match |
 
-**Total: 25 tests / 145 assertions / green in < 500 ms**
+**Total: 42 tests / 204 assertions / green in < 750 ms**
 
 ---
 
@@ -673,7 +675,52 @@ Spatie's `Projectionist::replay()` looks for `resetState()` on each projector an
 
 ---
 
-## 15. Commit history
+## 15. Extension — Scalar multi-dimensional answers (2026-09-17)
+
+Product asked to move from binary yes/no answers to multi-dimensional scalar answers (each question exposes N named dimensions, each answered on 0-100). Rather than break the existing `QuestionAnswered` events, we added a new event type that coexists with the old one — a real-world demonstration of how ES handles domain-model evolution without destructive migrations.
+
+### Question this extension answers
+
+> Can we change what "answering a question" means without invalidating the events we already recorded under the old model?
+
+### Pieces added
+
+| Piece | Role |
+|---|---|
+| Event `QuestionScored(userUuid, questionUuid, scores)` | New event carrying a `Record<dimension, int>` map. `scores` marked `#[Encrypted]`. |
+| `QuestionnaireResponseAggregate::score()` | Validates the payload (integers 0-100, non-empty), enforces the same invariants as `answer()` (no double commitment, no post-retraction re-commit). |
+| Aggregate state `$scored` | Parallel to `$answered`; both are treated as "commitments" for mutual-exclusion and retraction. |
+| Table `user_question_scores` | New projection table with UNIQUE `(user_uuid, question_uuid)` plus `scored_at`, `retracted_at`. |
+| `AnswerProjector::onQuestionScored` | Inserts into `user_question_scores`. |
+| `AnswerProjector::onAnswerRetracted` | Updates `retracted_at` in **both** tables (one is a no-op depending on which kind of commitment was made). |
+| Column `questions.dimensions` (JSON) | Per-question schema: `[{name, low_label, high_label}]`. |
+| `DetectMutualMatchReactor::onQuestionScored` | **Placeholder** match logic: fires `MutualPreferencesDetected` when both partners scored the same question with all dimensions ≥ 70. Marked with a TODO — real match logic will be delegated to an LLM-based compatibility judge. |
+| Endpoint `POST /questionnaire/scores` | Accepts `{question_uuid, scores: {dim: int}}`. |
+| `EncryptedEventSerializer` rewrite | Now operates on the JSON representation, letting us encrypt array-typed properties (like `scores`) as well as strings. |
+| Tests | `ScoreQuestionTest` (10 cases): index shape, encryption at rest, invariants (double-score, post-retract, cross-model exclusion, range validation), no partner leakage, placeholder match fires only when both are ≥70. |
+
+### Business rules decided
+
+- **Binary and scalar are mutually exclusive per question.** You can't score a question you already binary-answered, and vice versa. Enforced by the aggregate (single "commitment set").
+- **Retraction is unified.** The same `AnswerRetracted` event covers both types. Projectors touch both tables; only one row exists per (user, question), so the "wrong" UPDATE is silently a no-op.
+- **The placeholder match threshold (70/100 on every dimension) is a stub, not the product decision.** The real algorithm will be an LLM-based compatibility judge that emits richer output (matched vs. diverging dimensions + narrative for the reveal moment). The reactor is the one place we'll swap; the event stream stays untouched.
+- **Encryption still applies at the property level via `#[Encrypted]`.** The `scores` map is JSON-encoded then encrypted, so the row shape in `stored_events` is `"scores": "eyJp…"` — indistinguishable from an encrypted string.
+
+### Learnings
+
+1. **Evolving the domain model = introducing a new event type, not migrating the old one.** The 13 events from any previous session stay valid and replayable. Add a new event class, wire its projector and reactor handlers, and both models coexist. Retire the old one when product is ready — never before.
+2. **Typed properties + property mutation don't mix.** The original `EncryptedEventSerializer` mutated the event's properties in-place with a ciphertext string before delegating to `JsonEventSerializer`. That works fine for `string $answer` but fails on `array $scores` because PHP's type system refuses `string ↔ array` assignments even temporarily. Fix: serialize first, then edit the JSON representation. The event object is never mutated. Cleaner in both directions.
+3. **The reactor is where domain semantics live.** Same event data, three different "what counts as a match" strategies (binary yes/yes today, threshold ≥70 tomorrow, LLM judge next month). Swapping strategies is a reactor edit — no changes to events, aggregates, or projections.
+4. **`AnswerRetracted` was well-named in retrospect.** We used it originally for binary answers; the semantics ("withdraw a prior commitment on this question") turned out to be model-agnostic. Sometimes ES rewards good naming with free reuse.
+
+### What's next
+
+- Replace the placeholder threshold match with an LLM-based judge that returns `{ matched_dimensions, diverging_dimensions, narrative, confidence }`. Persist the LLM's output alongside `MutualPreferencesDetected` (new fields or a companion event). Product decision pending.
+- Deprecate `QuestionAnswered` in favor of `QuestionScored` for new deployments (the client already only writes to the new path). Old events stay in the store — history is history.
+
+---
+
+## 16. Commit history
 
 ```
 576ba2b  Match: reactor detects yes/yes on QuestionAnswered + reveal via GET /matches
@@ -688,7 +735,7 @@ f12c629  Initial commit: Laravel 13 skeleton + Sanctum Auth
 
 ---
 
-## 16. Resources
+## 17. Resources
 
 - **Spatie v7 docs:** https://spatie.be/docs/laravel-event-sourcing/v7/introduction
 - **Custom serializer (used here):** https://spatie.be/docs/laravel-event-sourcing/v7/advanced-usage/using-your-own-event-serializer

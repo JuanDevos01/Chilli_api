@@ -14,24 +14,34 @@ class QuestionnaireController extends Controller
     {
         $userUuid = $request->user()->uuid;
 
-        $questions = DB::table('questions')
+        $rows = DB::table('questions')
             ->leftJoin('user_answers', function ($join) use ($userUuid) {
                 $join->on('user_answers.question_uuid', '=', 'questions.uuid')
                     ->where('user_answers.user_uuid', '=', $userUuid)
                     ->whereNull('user_answers.retracted_at');
             })
+            ->leftJoin('user_question_scores', function ($join) use ($userUuid) {
+                $join->on('user_question_scores.question_uuid', '=', 'questions.uuid')
+                    ->where('user_question_scores.user_uuid', '=', $userUuid)
+                    ->whereNull('user_question_scores.retracted_at');
+            })
             ->select([
                 'questions.uuid',
                 'questions.text',
+                'questions.dimensions',
                 'user_answers.answer as my_answer',
+                'user_question_scores.scores as my_scores',
             ])
             ->orderBy('questions.id')
-            ->get()
-            ->map(fn ($row) => [
-                'uuid' => $row->uuid,
-                'text' => $row->text,
-                'my_answer' => $row->my_answer,
-            ]);
+            ->get();
+
+        $questions = $rows->map(fn ($row) => [
+            'uuid' => $row->uuid,
+            'text' => $row->text,
+            'dimensions' => $row->dimensions ? json_decode($row->dimensions, true) : [],
+            'my_answer' => $row->my_answer,
+            'my_scores' => $row->my_scores ? json_decode($row->my_scores, true) : null,
+        ]);
 
         return response()->json(['questions' => $questions]);
     }
@@ -47,6 +57,23 @@ class QuestionnaireController extends Controller
 
         QuestionnaireResponseAggregate::retrieve($userUuid)
             ->answer($validated['question_uuid'], $validated['answer'])
+            ->persist();
+
+        return response()->json(['status' => 'recorded'], 201);
+    }
+
+    public function score(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'question_uuid' => ['required', 'uuid', Rule::exists('questions', 'uuid')],
+            'scores' => ['required', 'array', 'min:1'],
+            'scores.*' => ['integer', 'between:0,100'],
+        ]);
+
+        $userUuid = $request->user()->uuid;
+
+        QuestionnaireResponseAggregate::retrieve($userUuid)
+            ->score($validated['question_uuid'], $validated['scores'])
             ->persist();
 
         return response()->json(['status' => 'recorded'], 201);

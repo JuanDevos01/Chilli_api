@@ -5,6 +5,7 @@ namespace App\Domain\Shared\EventSerializers;
 use App\Domain\Shared\Attributes\Encrypted;
 use Illuminate\Support\Facades\Crypt;
 use ReflectionClass;
+use ReflectionNamedType;
 use ReflectionProperty;
 use Spatie\EventSourcing\EventSerializers\EventSerializer;
 use Spatie\EventSourcing\EventSerializers\JsonEventSerializer;
@@ -21,22 +22,20 @@ class EncryptedEventSerializer implements EventSerializer
 
     public function serialize(ShouldBeStored $event): string
     {
-        $properties = $this->encryptedProperties($event);
-        $original = [];
+        $json = $this->inner->serialize($event);
+        $data = json_decode($json, true) ?? [];
 
-        foreach ($properties as $property) {
-            $value = $property->getValue($event);
-            $original[$property->getName()] = $value;
-            $property->setValue($event, Crypt::encryptString((string) $value));
-        }
-
-        try {
-            return $this->inner->serialize($event);
-        } finally {
-            foreach ($properties as $property) {
-                $property->setValue($event, $original[$property->getName()]);
+        foreach ($this->encryptedProperties(new ReflectionClass($event)) as $property) {
+            $name = $property->getName();
+            if (! array_key_exists($name, $data) || $data[$name] === null) {
+                continue;
             }
+
+            $plaintext = is_array($data[$name]) ? json_encode($data[$name]) : (string) $data[$name];
+            $data[$name] = Crypt::encryptString($plaintext);
         }
+
+        return json_encode($data);
     }
 
     public function deserialize(
@@ -45,26 +44,33 @@ class EncryptedEventSerializer implements EventSerializer
         int $version,
         ?string $metadata = null
     ): ShouldBeStored {
-        $event = $this->inner->deserialize($eventClass, $json, $version, $metadata);
+        $data = json_decode($json, true) ?? [];
+        $reflection = new ReflectionClass($eventClass);
 
-        foreach ($this->encryptedProperties($event) as $property) {
-            $value = $property->getValue($event);
+        foreach ($this->encryptedProperties($reflection) as $property) {
+            $name = $property->getName();
+            if (! array_key_exists($name, $data) || ! is_string($data[$name]) || $data[$name] === '') {
+                continue;
+            }
 
-            if (is_string($value) && $value !== '') {
-                $property->setValue($event, Crypt::decryptString($value));
+            $plaintext = Crypt::decryptString($data[$name]);
+            $type = $property->getType();
+
+            if ($type instanceof ReflectionNamedType && $type->getName() === 'array') {
+                $data[$name] = json_decode($plaintext, true) ?? [];
+            } else {
+                $data[$name] = $plaintext;
             }
         }
 
-        return $event;
+        return $this->inner->deserialize($eventClass, json_encode($data), $version, $metadata);
     }
 
     /**
      * @return ReflectionProperty[]
      */
-    private function encryptedProperties(object $event): array
+    private function encryptedProperties(ReflectionClass $reflection): array
     {
-        $reflection = new ReflectionClass($event);
-
         return array_values(array_filter(
             $reflection->getProperties(),
             fn (ReflectionProperty $p) => count($p->getAttributes(Encrypted::class)) > 0,

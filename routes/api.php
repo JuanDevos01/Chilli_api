@@ -28,6 +28,7 @@ Route::middleware('auth:sanctum')->prefix('couples')->group(function () {
 Route::middleware('auth:sanctum')->prefix('questionnaire')->group(function () {
     Route::get('/', [QuestionnaireController::class, 'index']);
     Route::post('/answers', [QuestionnaireController::class, 'answer']);
+    Route::post('/scores', [QuestionnaireController::class, 'score']);
     Route::delete('/answers/{questionUuid}', [QuestionnaireController::class, 'retract']);
 });
 
